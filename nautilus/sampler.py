@@ -17,6 +17,11 @@ from threadpoolctl import threadpool_limits
 from .bounds import NautilusBound, UnitCube
 from .pool import NautilusPool, likelihood_worker
 
+# spread_batch: points for each shell below n_shell, and the number of
+# chunks the rest of a batch is allocated in.
+SPREAD_FILL = 8
+SPREAD_CHUNKS = 12
+
 
 class Sampler:
     """A dynamic sampler using importance nested sampling.
@@ -127,7 +132,7 @@ class Sampler:
                  likelihood_kwargs=None, n_batch=None,
                  n_like_new_bound=None, vectorized=False, pass_dict=None,
                  pool=None, seed=None, blobs_dtype=None, filepath=None,
-                 resume=True):
+                 resume=True, spread_batch=False):
         r"""Initialize the sampler.
 
         Parameters
@@ -227,6 +232,13 @@ class Sampler:
             If True, resume from previous run if `filepath` exists. If False,
             start from scratch and overwrite any previous file. Default is
             True.
+        spread_batch : bool, optional
+            If True, each likelihood batch of the sampling phase is spread
+            over several shells instead of going to one shell. Shells with
+            fewer than `n_shell` points get a few points each, and the rest
+            goes in chunks to the shell the usual criterion picks, updated
+            after each chunk. Points in each shell are still uniform draws
+            from that shell, so the estimator is unchanged. Default is False.
 
         Raises
         ------
@@ -297,6 +309,7 @@ class Sampler:
                              "have one dictionary per network.")
 
         self.neural_network_kwargs = neural_network_kwargs
+        self.spread_batch = spread_batch
         self.vectorized = vectorized
         self.pass_dict = pass_dict
 
@@ -495,6 +508,12 @@ class Sampler:
                     self.discard_exploration = discard_exploration
                     if self.filepath is not None:
                         self.write(self.filepath, overwrite=True)
+
+            elif self.spread_batch and (np.any(self.shell_n < n_shell) or
+                                        self.n_eff < n_eff):
+                shells = self.add_samples_spread(n_shell, verbose=verbose)
+                if self.filepath is not None:
+                    self.write_shell_update(self.filepath, shells)
 
             elif np.any(self.shell_n < n_shell):
                 shell = np.flatnonzero(self.shell_n < n_shell)[0]
@@ -1160,6 +1179,94 @@ class Sampler:
 
         return np.sum(log_l >= self.shell_log_l_min[shell])
 
+    def add_samples_spread(self, n_shell, verbose=False):
+        """Add one batch of samples spread over several shells.
+
+        Only used in the sampling phase. Shells with fewer than `n_shell`
+        points first get up to `SPREAD_FILL` points each. The rest goes in
+        chunks of `n_batch // SPREAD_CHUNKS` to the shell with the highest
+        value of the criterion used by `run`, which is updated after each
+        chunk as if the number of points and the effective sample size of
+        that shell grew in proportion.
+
+        Parameters
+        ----------
+        n_shell : int
+            Minimum number of points in each shell.
+        verbose : bool, optional
+            If True, print additional information. Default is False.
+
+        Returns
+        -------
+        shells : numpy.ndarray
+            Indices of the shells that received points.
+
+        """
+        if verbose:
+            self.print_status('Sampling', end='\r')
+
+        n_batch = self.n_batch
+        alloc = np.zeros(len(self.bounds), dtype=int)
+        left = n_batch
+        for shell in np.flatnonzero(self.shell_n < n_shell):
+            n = min(SPREAD_FILL, left)
+            alloc[shell] += n
+            left -= n
+
+        n = self.shell_n.astype(float)
+        n_eff = np.asarray(self.shell_n_eff, dtype=float).copy()
+
+        def criterion(shell):
+            if n[shell] <= 0:
+                return -np.inf
+            return (self.shell_log_l[shell] + self.shell_log_v[shell] -
+                    0.5 * np.log(n[shell]) -
+                    0.5 * np.log(max(n_eff[shell], 1e-300)))
+
+        crit = np.array([criterion(shell) for shell in range(len(n))])
+        chunk = max(1, n_batch // SPREAD_CHUNKS)
+        while left > 0 and np.any(np.isfinite(crit)):
+            shell = int(np.argmax(crit))
+            k = min(chunk, left)
+            alloc[shell] += k
+            left -= k
+            n_eff[shell] *= (n[shell] + k) / n[shell]
+            n[shell] += k
+            crit[shell] = criterion(shell)
+
+        shells = np.flatnonzero(alloc)
+        points, owner = [], []
+        for shell in shells:
+            self.n_batch = int(alloc[shell])
+            try:
+                points_shell, n_bound = self.sample_shell(int(shell))
+            finally:
+                self.n_batch = n_batch
+            self.shell_n_sample[shell] += n_bound
+            points.append(points_shell)
+            owner.append(np.full(len(points_shell), shell))
+        points = np.concatenate(points)
+        owner = np.concatenate(owner)
+
+        if verbose:
+            self.print_status('Computing', end='\r')
+        log_l, blobs = self.evaluate_likelihood(points)
+        for shell in shells:
+            select = owner == shell
+            self.points[shell] = np.append(
+                self.points[shell], points[select], axis=0)
+            self.log_l[shell] = np.append(
+                self.log_l[shell], log_l[select], axis=0)
+            if blobs is not None:
+                if self.blobs is None:
+                    self.blobs = [blobs[select]]
+                else:
+                    self.blobs[shell] = np.append(
+                        self.blobs[shell], blobs[select], axis=0)
+            self.update_shell_info(int(shell))
+
+        return shells
+
     @property
     def f_live(self):
         """Estimate the fraction of the evidence contained in the live set.
@@ -1353,18 +1460,17 @@ class Sampler:
         fstream.close()
 
     def write_shell_update(self, filepath, shell):
-        """Update the sampler data for a single shell.
+        """Update the sampler data for one or several shells.
 
         Parameters
         ----------
         filepath : string or pathlib.Path
             Path to the file. Must have a '.h5' or '.hdf5' extension.
-        shell : int
-            Shell index for which to write the upate.
+        shell : int or array_like
+            Shell index or indices for which to write the upate.
 
         """
-        if shell < 0:
-            shell = len(self.bounds) + shell
+        shells = [int(s) % len(self.bounds) for s in np.atleast_1d(shell)]
         fstream = h5py.File(Path(filepath), 'r+')
         group = fstream['sampler']
 
@@ -1373,21 +1479,21 @@ class Sampler:
                     'n_update_iter', 'n_like_iter']:
             group.attrs[key] = getattr(self, key)
 
-        group[f'points_{shell}'].resize(self.points[shell].shape)
-        group[f'points_{shell}'][...] = self.points[shell]
-        group[f'log_l_{shell}'].resize(self.log_l[shell].shape)
-        group[f'log_l_{shell}'][...] = self.log_l[shell]
-        if self.blobs is not None:
-            group[f'blobs_{shell}'].resize(self.blobs[shell].shape)
-            group[f'blobs_{shell}'][...] = self.blobs[shell]
+        for shell in shells:
+            group[f'points_{shell}'].resize(self.points[shell].shape)
+            group[f'points_{shell}'][...] = self.points[shell]
+            group[f'log_l_{shell}'].resize(self.log_l[shell].shape)
+            group[f'log_l_{shell}'][...] = self.log_l[shell]
+            if self.blobs is not None:
+                group[f'blobs_{shell}'].resize(self.blobs[shell].shape)
+                group[f'blobs_{shell}'][...] = self.blobs[shell]
+            if isinstance(self.bounds[shell], NautilusBound):
+                self.bounds[shell].update(fstream[f'bound_{shell}'])
 
         for key in ['points_t', 'shell_t', 'log_l_t', 'blobs_t']:
             if getattr(self, key) is not None:
                 group[key].resize(getattr(self, key).shape)
                 group[key][...] = getattr(self, key)
-
-        if isinstance(self.bounds[shell], NautilusBound):
-            self.bounds[shell].update(fstream[f'bound_{shell}'])
 
         rng_state = self.rng.bit_generator.state
         group.attrs['rng_state'] = str(rng_state['state']['state'])

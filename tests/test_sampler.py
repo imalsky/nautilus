@@ -170,7 +170,8 @@ def test_sampler_prior(custom_prior, vectorized, pass_dict):
 
 @pytest.mark.parametrize("n_networks", [0, 4])
 @pytest.mark.parametrize("discard_exploration", [True, False])
-def test_sampler_accuracy(n_networks, discard_exploration):
+@pytest.mark.parametrize("spread_batch", [False, True])
+def test_sampler_accuracy(n_networks, discard_exploration, spread_batch):
     # Do a basic tests of the sampler accuracy.
 
     n_dim = 2
@@ -184,7 +185,8 @@ def test_sampler_accuracy(n_networks, discard_exploration):
         return multivariate_normal.logpdf(x, mean=mean, cov=cov)
 
     sampler = Sampler(prior, likelihood, n_dim=n_dim, n_live=500,
-                      n_networks=n_networks, seed=0)
+                      n_networks=n_networks, seed=0,
+                      spread_batch=spread_batch)
     sampler.run(discard_exploration=discard_exploration, f_live=0.1,
                 verbose=True)
 
@@ -303,7 +305,8 @@ def test_sampler_timeout():
     success = sampler.run(verbose=True, timeout=5)
 
 
-def test_sampler_funnel():
+@pytest.mark.parametrize("spread_batch", [False, True])
+def test_sampler_funnel(spread_batch):
     # Test the sampler on a funnel distribution. This is a great, challenging
     # distribution. Also, the nature of the likelihood leads to nautilus
     # boundaries that are not strictly nested, unlike for simpler
@@ -325,7 +328,8 @@ def test_sampler_funnel():
     x_1 = np.random.normal(loc=0.5, scale=np.exp(20 * (x_0 - 0.5)) / 100)
     log_z_true = np.log(np.mean((x_0 > 0) & (x_0 < 1) & (x_1 > 0) & (x_1 < 1)))
 
-    sampler = Sampler(prior, likelihood, n_dim=2, n_networks=1, seed=0)
+    sampler = Sampler(prior, likelihood, n_dim=2, n_networks=1, seed=0,
+                      spread_batch=spread_batch)
     sampler.run(verbose=True)
     assert np.isclose(log_z_true, sampler.log_z, rtol=0, atol=0.1)
     # Check whether the boundaries nautilus drew are strictly nested.

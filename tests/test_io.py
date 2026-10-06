@@ -119,8 +119,9 @@ def test_bounds_io(h5py_group, bound_class, rng_sync):
 @pytest.mark.parametrize("discard_exploration", [True, False])
 @pytest.mark.parametrize("n_networks", [0, 1])
 @pytest.mark.parametrize("periodic", [None, np.arange(1)])
+@pytest.mark.parametrize("spread_batch", [False, True])
 def test_sampler_io(blobs, n_like_max, discard_exploration, n_networks,
-                    periodic):
+                    periodic, spread_batch):
     # Test that we can write and read a sampler correctly. In particular, also
     # test that the random number generator is correctly set after writing and
     # reading. Also make sure that the sampler can print out the progress.
@@ -136,12 +137,14 @@ def test_sampler_io(blobs, n_like_max, discard_exploration, n_networks,
 
     sampler_write = Sampler(prior, likelihood, n_dim=2, n_live=100,
                             n_networks=n_networks, periodic=periodic,
-                            filepath='test.hdf5', resume=False, seed=0)
+                            filepath='test.hdf5', resume=False, seed=0,
+                            spread_batch=spread_batch)
     sampler_write.run(f_live=0.45, n_eff=1000, n_like_max=n_like_max,
                       discard_exploration=discard_exploration)
     sampler_read = Sampler(prior, likelihood, n_dim=2, n_live=100,
                            n_networks=n_networks, periodic=periodic,
-                           filepath='test.hdf5', resume=True)
+                           filepath='test.hdf5', resume=True,
+                           spread_batch=spread_batch)
     assert sampler_write.log_z == sampler_read.log_z
 
     sampler_write.run(f_live=0.45, n_eff=5000,
